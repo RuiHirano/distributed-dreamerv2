@@ -8,20 +8,8 @@ class Actor:
     self._pid = pid
     self._envs = envs
     self._kwargs = kwargs
-    self._on_steps = []
-    self._on_resets = []
-    self._on_episodes = []
     self._act_spaces = [env.act_space for env in envs]
     self.reset()
-
-  def on_step(self, callback):
-    self._on_steps.append(callback)
-
-  def on_reset(self, callback):
-    self._on_resets.append(callback)
-
-  def on_episode(self, callback):
-    self._on_episodes.append(callback)
 
   def reset(self):
     self._obs = [None] * len(self._envs)
@@ -30,6 +18,7 @@ class Actor:
 
   def rollout(self, policy, steps=0, episodes=0):
     step, episode = 0, 0
+    eps = []
     while step < steps or episode < episodes:
       obs = {
           i: self._envs[i].reset()
@@ -38,7 +27,6 @@ class Actor:
         self._obs[i] = ob() if callable(ob) else ob
         act = {k: np.zeros(v.shape) for k, v in self._act_spaces[i].items()}
         tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
-        [fn(tran, worker=i, **self._kwargs) for fn in self._on_resets]
         self._eps[i] = [tran]
       obs = {k: np.stack([o[k] for o in self._obs]) for k in self._obs[0]}
       actions, self._state = policy(obs, self._state, **self._kwargs)
@@ -50,15 +38,15 @@ class Actor:
       obs = [ob() if callable(ob) else ob for ob in obs]
       for i, (act, ob) in enumerate(zip(actions, obs)):
         tran = {k: self._convert(v) for k, v in {**ob, **act}.items()}
-        [fn(tran, worker=i, **self._kwargs) for fn in self._on_steps]
         self._eps[i].append(tran)
         step += 1
         if ob['is_last']:
           ep = self._eps[i]
           ep = {k: self._convert([t[k] for t in ep]) for k in ep[0]}
-          [fn(ep, **self._kwargs) for fn in self._on_episodes]
+          eps.append(ep)
           episode += 1
       self._obs = obs
+    return eps, self._pid
 
   def _convert(self, value):
     value = np.array(value)

@@ -16,17 +16,9 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 import numpy as np
 import ruamel.yaml as yaml
 
-import agent
+from actor import Actor
+from learner import Learner
 import common
-from .actor import Actor
-from .learner import Learner
-
-from common import Config
-from common import GymWrapper
-from common import RenderImage
-from common import TerminalOutput
-from common import JSONLOutput
-from common import TensorBoardOutput
 
 configs = yaml.safe_load(
     (pathlib.Path(__file__).parent / 'configs.yaml').read_text())
@@ -34,6 +26,7 @@ defaults = common.Config(configs.pop('defaults'))
 
 
 def train(env, config, outputs=None):
+  ray.init()
 
   logdir = pathlib.Path(config.logdir).expanduser()
   logdir.mkdir(parents=True, exist_ok=True)
@@ -51,8 +44,6 @@ def train(env, config, outputs=None):
   logger = common.Logger(step, outputs, multiplier=config.action_repeat)
   metrics = collections.defaultdict(list)
 
-  should_train = common.Every(config.train_every)
-  should_log = common.Every(config.log_every)
   should_video = common.Every(config.log_every)
   should_expl = common.Until(config.expl_until)
 
@@ -73,7 +64,7 @@ def train(env, config, outputs=None):
     print(f'Prefill dataset ({prefill} steps).')
     wip_actors = [actor.rollout.remote(random_policy, steps=int(prefill/config.num_actors)) for actor in actors]
     results = ray.get(wip_actors)
-    for (episodes, total_steps) in results:
+    for episodes, pid in results:
       replay.add_episodes(episodes)
 
 
@@ -87,8 +78,8 @@ def train(env, config, outputs=None):
     for _ in range(config.pretrain):
       wip_learner = learner.train.remote(next(dataset))
       (metrics) = ray.get(wip_learner)[0]
-      policy = lambda *args: learner.policy.remote(
-          *args, mode='explore' if should_expl(step) else 'train')
+  policy = lambda *args: learner.policy.remote(
+      *args, mode='explore' if should_expl(step) else 'train')
 
   def write_log(metrics):
     for name, values in metrics.items():

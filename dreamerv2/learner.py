@@ -2,8 +2,8 @@ import tensorflow as tf
 from tensorflow.keras import mixed_precision as prec
 
 import common
-import expl
 import ray
+import expl2
 
 @ray.remote(num_cpus=1, num_gpus=1 if tf.test.is_gpu_available() else 0)
 class Learner(common.Module):
@@ -13,13 +13,14 @@ class Learner(common.Module):
     self.obs_space = obs_space
     self.act_space = act_space['action']
     self.step = step
+    self._state = None
     self.tfstep = tf.Variable(int(self.step), tf.int64)
     self.wm = WorldModel(config, obs_space, self.tfstep)
     self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
     if config.expl_behavior == 'greedy':
       self._expl_behavior = self._task_behavior
     else:
-      self._expl_behavior = getattr(expl, config.expl_behavior)(
+      self._expl_behavior = getattr(expl2, config.expl_behavior)(
           self.config, self.act_space, self.wm, self.tfstep,
           lambda seq: self.wm.heads['reward'](seq['feat']).mode())
 
@@ -57,8 +58,10 @@ class Learner(common.Module):
 
   @tf.function
   def train(self, data, state=None):
+    if state == None:
+      state = self._state
     metrics = {}
-    state, outputs, mets = self.wm.train(data, state)
+    self._state, outputs, mets = self.wm.train(data, state)
     metrics.update(mets)
     start = outputs['post']
     reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
@@ -67,7 +70,7 @@ class Learner(common.Module):
     if self.config.expl_behavior != 'greedy':
       mets = self._expl_behavior.train(start, outputs, data)[-1]
       metrics.update({'expl_' + key: value for key, value in mets.items()})
-    return state, metrics
+    return metrics
 
   @tf.function
   def report(self, data):
