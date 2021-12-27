@@ -28,6 +28,10 @@ defaults:
   log_keys_max: '^$'
   precision: 16
   jit: True
+  # Add Parameter
+  num_actors: 2
+  actor_steps: 1000
+
 
   # Agent
   clip_rewards: tanh

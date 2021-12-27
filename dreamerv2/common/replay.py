@@ -61,6 +61,10 @@ class Replay:
     self._complete_eps[str(filename)] = episode
     self._enforce_limit()
 
+  def add_episodes(self, episodes):
+    for ep in episodes:
+      self.add_episode(ep)
+
   def dataset(self, batch, length):
     example = next(iter(self._generate_chunks(length)))
     dataset = tf.data.Dataset.from_generator(
