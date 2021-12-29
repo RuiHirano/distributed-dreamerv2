@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import sys
+import time
 import warnings
 import ray
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -11,13 +12,11 @@ logging.getLogger().setLevel('ERROR')
 warnings.filterwarnings('ignore', '.*box bound precision lowered.*')
 
 sys.path.append(str(pathlib.Path(__file__).parent))
-sys.path.append(str(pathlib.Path(__file__).parent.parent))
-
 import numpy as np
 import ruamel.yaml as yaml
 
-from actor import Actor
-from learner import Learner
+#from actor import Actor
+from learner_actor import Learner, Actor
 import common
 
 configs = yaml.safe_load(
@@ -27,6 +26,12 @@ defaults = common.Config(configs.pop('defaults'))
 
 def train(env, config, outputs=None):
   ray.init()
+  def add_path(*args, **kwargs):
+    sys.path.append(str(pathlib.Path(__file__).parent))
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    logging.getLogger().setLevel('ERROR')
+    warnings.filterwarnings('ignore', '.*box bound precision lowered.*')
+  ray.worker.global_worker.run_function_on_all_workers(add_path)
 
   logdir = pathlib.Path(config.logdir).expanduser()
   logdir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +51,7 @@ def train(env, config, outputs=None):
 
   should_video = common.Every(config.log_every)
   should_expl = common.Until(config.expl_until)
+  should_log = common.Every(config.log_every)
 
   env = common.GymWrapper(env)
   env = common.ResizeImage(env)
@@ -54,15 +60,17 @@ def train(env, config, outputs=None):
   else:
     env = common.NormalizeAction(env)
   env = common.TimeLimit(env, config.time_limit)
-
-  actors = [Actor.remote(pid=i, envs=[env]) for i in range(config.num_actors)]
-  learner = Learner.remote(config, env.obs_space, env.act_space, step)
-  random_policy = lambda *args: learner.policy.remote(*args, mode='random')
+  actors = [Actor.remote(pid=i, env=env, config=config, step=step) for i in range(config.num_actors)]
+  learner = Learner.remote(config, env, step)
+  variables = ray.get(learner.get_variables.remote())
+  variables = ray.put(variables)
+  #random_policy = lambda *args: learner.policy.remote(*args, mode='random')
+  #random_policy = ray.put(random_policy)
 
   prefill = max(0, config.prefill - replay.stats['total_steps'])
   if prefill:
     print(f'Prefill dataset ({prefill} steps).')
-    wip_actors = [actor.rollout.remote(random_policy, steps=int(prefill/config.num_actors)) for actor in actors]
+    wip_actors = [actor.rollout.remote(variables, steps=int(prefill/config.num_actors), mode='random') for actor in actors]
     results = ray.get(wip_actors)
     for episodes, pid in results:
       replay.add_episodes(episodes)
@@ -73,13 +81,15 @@ def train(env, config, outputs=None):
   dataset = iter(replay.dataset(**config.dataset))
   if (logdir / 'variables.pkl').exists():
     learner.load.remote(logdir / 'variables.pkl')
+    variables = ray.get(learner.get_variables.remote())
+    variables = ray.put(variables)
   else:
     print('Pretrain agent.')
     for _ in range(config.pretrain):
-      wip_learner = learner.train.remote(next(dataset))
-      (metrics) = ray.get(wip_learner)[0]
-  policy = lambda *args: learner.policy.remote(
-      *args, mode='explore' if should_expl(step) else 'train')
+      variables, mets = ray.get(learner.train.remote(next(dataset)))
+      variables = ray.put(variables)
+  #policy = lambda *args: learner.policy.remote(
+  #    *args, mode='explore' if should_expl(step) else 'train')
 
   def write_log(metrics):
     for name, values in metrics.items():
@@ -108,23 +118,27 @@ def train(env, config, outputs=None):
     logger.write()
 
   wip_learner = learner.train.remote(next(dataset))
-  wip_actors = [actor.rollout.remote(policy, steps=config.actor_steps) for actor in actors]
+  wip_actors = [actor.rollout.remote(variables, steps=config.actor_steps, mode='train') for actor in actors]
   while replay.stats["total_steps"] < config.steps:
     logger.write()
     # correct experiments
     finished_actors, wip_actors = ray.wait(wip_actors, timeout=0)
     if finished_actors:
       for finished in finished_actors:
-        episodes, pid = ray.get(finished[0])
+        episodes, pid = ray.get(finished)
         replay.add_episodes(episodes)
-        wip_actors.extend([actors[pid].rollout.remote(policy, steps=config.actor_steps)])
+        if should_expl(step):
+          wip_actors.extend([actors[pid].rollout.remote(variables, steps=config.actor_steps, mode='explore')])
         for ep in episodes:
           per_episode(ep)
 
     # train learner
     finished_learner, _ = ray.wait([wip_learner], timeout=0)
     if finished_learner:
-      (metrics) = ray.get(wip_learner)[0]
-      wip_learner = learner.train.remote(next(dataset))
+      variables, mets = ray.get(finished_learner[0])
+      [metrics[key].append(value) for key, value in mets.items()]
+      variables = ray.put(variables)
       # write logs
-      write_log(metrics)
+      if should_log(step):
+        write_log(metrics)
+      wip_learner = learner.train.remote(next(dataset))
