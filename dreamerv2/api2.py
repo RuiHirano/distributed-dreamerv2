@@ -40,7 +40,7 @@ def train(env, config, outputs=None):
   print('Logdir', logdir)
 
   outputs = outputs or [
-      common.TerminalOutput(),
+      #common.TerminalOutput(),
       common.JSONLOutput(config.logdir),
       common.TensorBoardOutput(config.logdir),
   ]
@@ -60,8 +60,8 @@ def train(env, config, outputs=None):
   else:
     env = common.NormalizeAction(env)
   env = common.TimeLimit(env, config.time_limit)
-  actors = [Actor.remote(pid=i, env=env, config=config, step=step) for i in range(config.num_actors)]
-  learner = Learner.remote(config, env, step)
+  actors = [Actor.remote(pid=i, env=env, config=config) for i in range(config.num_actors)]
+  learner = Learner.remote(config, env)
   variables = ray.get(learner.get_variables.remote())
   variables = ray.put(variables)
   #random_policy = lambda *args: learner.policy.remote(*args, mode='random')
@@ -72,9 +72,8 @@ def train(env, config, outputs=None):
     print(f'Prefill dataset ({prefill} steps).')
     wip_actors = [actor.rollout.remote(variables, steps=int(prefill/config.num_actors), mode='random') for actor in actors]
     results = ray.get(wip_actors)
-    for episodes, pid in results:
+    for episodes, _ in results:
       replay.add_episodes(episodes)
-
 
   print('Create agent.')
   #agnt = agent.Agent(config, env.obs_space, env.act_space, step)
@@ -86,7 +85,7 @@ def train(env, config, outputs=None):
   else:
     print('Pretrain agent.')
     for _ in range(config.pretrain):
-      variables, mets = ray.get(learner.train.remote(next(dataset)))
+      variables, mets, info = ray.get(learner.train.remote(next(dataset)))
       variables = ray.put(variables)
   #policy = lambda *args: learner.policy.remote(
   #    *args, mode='explore' if should_expl(step) else 'train')
@@ -101,7 +100,6 @@ def train(env, config, outputs=None):
   def per_episode(ep):
     length = len(ep['reward']) - 1
     score = float(ep['reward'].astype(np.float64).sum())
-    print(f'Episode has {length} steps and return {score:.1f}.')
     logger.scalar('return', score)
     logger.scalar('length', length)
     for key, value in ep.items():
@@ -116,28 +114,42 @@ def train(env, config, outputs=None):
         logger.video(f'policy_{key}', ep[key])
     logger.add(replay.stats)
     logger.write()
+    return length, score
 
   wip_learner = learner.train.remote(next(dataset))
   wip_actors = [actor.rollout.remote(variables, steps=config.actor_steps, mode='train') for actor in actors]
+  actor_cycle = 0
+  train_num = 0
+  prev_total_steps = replay.stats["total_steps"]
   while replay.stats["total_steps"] < config.steps:
     logger.write()
     # correct experiments
     finished_actors, wip_actors = ray.wait(wip_actors, timeout=0)
     if finished_actors:
       for finished in finished_actors:
-        episodes, pid = ray.get(finished)
+        actor_cycle += 1
+        episodes, info = ray.get(finished)
         replay.add_episodes(episodes)
         if should_expl(step):
-          wip_actors.extend([actors[pid].rollout.remote(variables, steps=config.actor_steps, mode='explore')])
+          wip_actors.extend([actors[info["pid"]].rollout.remote(variables, steps=config.actor_steps, mode='explore')])
+        # log
+        mean_length, mean_score = 0, 0
         for ep in episodes:
-          per_episode(ep)
+          length, score = per_episode(ep)
+          mean_length += length
+          mean_score += score
+        mean_length, mean_score = mean_length/len(episodes), mean_score/len(episodes)
+        print("[{}] Actor Cycle: {}, Steps, {}, PID: {}, Episode has {:.0f} steps and return {:.1f}., time: {}".format(replay.stats["total_steps"], actor_cycle, config.actor_steps, info["pid"], mean_length, mean_score, info["elapsed_time"]))
 
     # train learner
     finished_learner, _ = ray.wait([wip_learner], timeout=0)
     if finished_learner:
-      variables, mets = ray.get(finished_learner[0])
+      variables, mets, info = ray.get(finished_learner[0])
       [metrics[key].append(value) for key, value in mets.items()]
       variables = ray.put(variables)
+      train_num += 1
+      print("Finished learner train: {}, actor_cycle: {}, steps: {}, time: {}".format(train_num, actor_cycle, replay.stats["total_steps"]-prev_total_steps, info["elapsed_time"]))
+      actor_cycle = 0
       # write logs
       if should_log(step):
         write_log(metrics)

@@ -1,13 +1,13 @@
 import tensorflow as tf
 from tensorflow_probability import distributions as tfd
 
-import learner
+import learner_actor
 import common
 
 
 class Random(common.Module):
 
-  def __init__(self, config, act_space, wm, tfstep, reward):
+  def __init__(self, config, act_space, wm, reward):
     self.config = config
     self.act_space = self.act_space
 
@@ -25,11 +25,11 @@ class Random(common.Module):
 
 class Plan2Explore(common.Module):
 
-  def __init__(self, config, act_space, wm, tfstep, reward):
+  def __init__(self, config, act_space, wm, reward):
     self.config = config
     self.reward = reward
     self.wm = wm
-    self.ac = learner.ActorCritic(config, act_space, tfstep)
+    self.ac = learner_actor.ActorCritic(config, act_space)
     self.actor = self.ac.actor
     stoch_size = config.rssm.stoch
     if config.rssm.discrete:
@@ -98,11 +98,11 @@ class Plan2Explore(common.Module):
 
 class ModelLoss(common.Module):
 
-  def __init__(self, config, act_space, wm, tfstep, reward):
+  def __init__(self, config, act_space, wm, reward):
     self.config = config
     self.reward = reward
     self.wm = wm
-    self.ac = learner.ActorCritic(config, act_space, tfstep)
+    self.ac = learner_actor.ActorCritic(config, act_space)
     self.actor = self.ac.actor
     self.head = common.MLP([], **self.config.expl_head)
     self.opt = common.Optimizer('expl', **self.config.expl_opt)

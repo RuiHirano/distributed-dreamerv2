@@ -29,7 +29,7 @@ defaults:
   precision: 16
   jit: True
   # Add Parameter
-  num_actors: 2
+  num_actors: 5
   actor_steps: 1000
 
 
