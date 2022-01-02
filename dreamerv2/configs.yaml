@@ -30,7 +30,8 @@ defaults:
   jit: True
   # Add Parameter
   num_actors: 5
-  actor_steps: 1000
+  rollout_min_steps: 1000
+  rollout_min_episodes: 1
 
 
   # Agent

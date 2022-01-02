@@ -52,6 +52,7 @@ def train(env, config, outputs=None):
   should_video = common.Every(config.log_every)
   should_expl = common.Until(config.expl_until)
   should_log = common.Every(config.log_every)
+  should_save = common.Every(config.log_every)
 
   env = common.GymWrapper(env)
   env = common.ResizeImage(env)
@@ -62,15 +63,11 @@ def train(env, config, outputs=None):
   env = common.TimeLimit(env, config.time_limit)
   actors = [Actor.remote(pid=i, env=env, config=config) for i in range(config.num_actors)]
   learner = Learner.remote(config, env)
-  variables = ray.get(learner.get_variables.remote())
-  variables = ray.put(variables)
-  #random_policy = lambda *args: learner.policy.remote(*args, mode='random')
-  #random_policy = ray.put(random_policy)
 
   prefill = max(0, config.prefill - replay.stats['total_steps'])
   if prefill:
     print(f'Prefill dataset ({prefill} steps).')
-    wip_actors = [actor.rollout.remote(variables, steps=int(prefill/config.num_actors), mode='random') for actor in actors]
+    wip_actors = [actor.rollout.remote(steps=int(prefill/config.num_actors), mode='random') for actor in actors]
     results = ray.get(wip_actors)
     for episodes, _ in results:
       replay.add_episodes(episodes)
@@ -78,8 +75,12 @@ def train(env, config, outputs=None):
   print('Create agent.')
   #agnt = agent.Agent(config, env.obs_space, env.act_space, step)
   dataset = iter(replay.dataset(**config.dataset))
+  variables = None
+  ray.get([actor.train.remote(next(dataset)) for actor in actors])
+  ray.get(learner.train.remote(next(dataset)))
   if (logdir / 'variables.pkl').exists():
-    learner.load.remote(logdir / 'variables.pkl')
+    ray.get(learner.load.remote(logdir / 'variables.pkl'))
+    ray.get([actor.load.remote(logdir / 'variables.pkl') for actor in actors])
     variables = ray.get(learner.get_variables.remote())
     variables = ray.put(variables)
   else:
@@ -117,7 +118,7 @@ def train(env, config, outputs=None):
     return length, score
 
   wip_learner = learner.train.remote(next(dataset))
-  wip_actors = [actor.rollout.remote(variables, steps=config.actor_steps, mode='train') for actor in actors]
+  wip_actors = [actor.rollout.remote(variables, steps=config.rollout_min_steps, episodes=config.rollout_min_episodes, mode='train') for actor in actors]
   actor_cycle = 0
   train_num = 0
   prev_total_steps = replay.stats["total_steps"]
@@ -131,15 +132,19 @@ def train(env, config, outputs=None):
         episodes, info = ray.get(finished)
         replay.add_episodes(episodes)
         if should_expl(step):
-          wip_actors.extend([actors[info["pid"]].rollout.remote(variables, steps=config.actor_steps, mode='explore')])
+          print("expl agent")
+          wip_actors.extend([actors[info["pid"]].rollout.remote(variables, steps=config.rollout_min_steps, episodes=config.rollout_min_episodes, mode='explore')])
+        else:
+          wip_actors.extend([actors[info["pid"]].rollout.remote(variables, steps=config.rollout_min_steps, episodes=config.rollout_min_episodes, mode='train')])
         # log
-        mean_length, mean_score = 0, 0
-        for ep in episodes:
-          length, score = per_episode(ep)
-          mean_length += length
-          mean_score += score
-        mean_length, mean_score = mean_length/len(episodes), mean_score/len(episodes)
-        print("[{}] Actor Cycle: {}, Steps, {}, PID: {}, Episode has {:.0f} steps and return {:.1f}., time: {}".format(replay.stats["total_steps"], actor_cycle, config.actor_steps, info["pid"], mean_length, mean_score, info["elapsed_time"]))
+        if len(episodes) > 0:
+          mean_length, mean_score = 0, 0
+          for ep in episodes:
+            length, score = per_episode(ep)
+            mean_length += length
+            mean_score += score
+          mean_length, mean_score = mean_length/len(episodes), mean_score/len(episodes)
+          print("[{}] Actor Cycle: {}, Steps, {}, PID: {}, Episode has {:.0f} steps and return {:.1f}., time: {:.1f}".format(replay.stats["total_steps"], actor_cycle, config.rollout_min_steps, info["pid"], mean_length, mean_score, info["elapsed_time"]))
 
     # train learner
     finished_learner, _ = ray.wait([wip_learner], timeout=0)
@@ -148,9 +153,12 @@ def train(env, config, outputs=None):
       [metrics[key].append(value) for key, value in mets.items()]
       variables = ray.put(variables)
       train_num += 1
-      print("Finished learner train: {}, actor_cycle: {}, steps: {}, time: {}".format(train_num, actor_cycle, replay.stats["total_steps"]-prev_total_steps, info["elapsed_time"]))
+      print("Finished learner train: {}, actor_cycle: {}, steps: {}, time: {:.1f}".format(train_num, actor_cycle, replay.stats["total_steps"]-prev_total_steps, info["elapsed_time"]))
       actor_cycle = 0
       # write logs
       if should_log(step):
         write_log(metrics)
+      # save variables
+      if should_save(step):
+        learner.save.remote(logdir / 'variables.pkl')
       wip_learner = learner.train.remote(next(dataset))

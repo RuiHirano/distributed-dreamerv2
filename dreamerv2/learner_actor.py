@@ -17,19 +17,12 @@ class Actor(common.Module):
     self.config = config
     self.obs_space = env.obs_space
     self.act_space = env.act_space['action']
-    #self.step = step
-    self._state = None
-    #self.tfstep = tf.Variable(int(self.step), tf.int64)
-    #self.wm = WorldModel(config, env.obs_space, self.tfstep)
-    #self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
+    self._train_state = None
     self.wm = WorldModel(config, env.obs_space)
     self._task_behavior = ActorCritic(config, self.act_space)
     if config.expl_behavior == 'greedy':
       self._expl_behavior = self._task_behavior
     else:
-      #self._expl_behavior = getattr(expl2, config.expl_behavior)(
-      #    self.config, self.act_space, self.wm, self.tfstep,
-      #    lambda seq: self.wm.heads['reward'](seq['feat']).mode())
       self._expl_behavior = getattr(expl2, config.expl_behavior)(
           self.config, self.act_space, self.wm,
           lambda seq: self.wm.heads['reward'](seq['feat']).mode())
@@ -40,9 +33,10 @@ class Actor(common.Module):
     self._eps = [None] * len(self._envs)
     self._state = None
   
-  def rollout(self, variables, steps=0, episodes=0, mode='train'):
+  def rollout(self, variables=None, steps=0, episodes=0, mode='train'):
     # Load weights
-    self.set_variables(variables)
+    if variables:
+      self.set_variables(variables)
 
     step, episode = 0, 0
     eps = []
@@ -91,8 +85,6 @@ class Actor(common.Module):
   #@tf.function
   def policy(self, obs, state=None, mode='train'):
     obs = tf.nest.map_structure(tf.tensor, obs)
-    #tf.py_function(lambda: self.tfstep.assign(
-    #    int(self.step), read_value=False), [], [])
     if state is None:
       latent = self.wm.rssm.initial(len(obs['reward']))
       action = tf.zeros((len(obs['reward']),) + self.act_space.shape)
@@ -128,17 +120,28 @@ class Actor(common.Module):
     state = (latent, action)
     return outputs, state
 
+  #@tf.function
+  def train(self, data, state=None):
+    s_time = time.time()
+    if state == None:
+      state = self._train_state
+    metrics = {}
+    self._train_state, outputs, mets = self.wm.train(data, state)
+    metrics.update(mets)
+    start = outputs['post']
+    reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
+    metrics.update(self._task_behavior.train(
+        self.wm, start, data['is_terminal'], reward))
+    if self.config.expl_behavior != 'greedy':
+      mets = self._expl_behavior.train(start, outputs, data)[-1]
+      metrics.update({'expl_' + key: value for key, value in mets.items()})
+    elapsed_time = time.time() - s_time
+    info = {"elapsed_time": elapsed_time}
+    return self.variables, metrics, info
+
   def set_variables(self, variables):
     #return
-    #print("self.variables", [(var.name, var.dtype) for var in self.variables], len([var.name for var in self.variables]))
-    #print("variables", [(var.name, var.dtype) for var in variables], len([var.name for var in variables]))
-    my_variable_names = [var.name for var in self.variables]
-    cp_variables = ()
-    for var in variables:
-      if hasattr(var, 'name') and var.name in my_variable_names and var.dtype != tf.float64:
-        cp_variables += (var,)
-    if len(self.variables) == len(cp_variables):
-      tf.nest.map_structure(lambda x, y: x.assign(y), self.variables, cp_variables)
+    tf.nest.map_structure(lambda x, y: x.assign(y), self.variables, variables)
 
 @ray.remote(num_cpus=1, num_gpus=1 if tf.config.list_physical_devices('GPU') else 0)
 class Learner(common.Module):
@@ -147,19 +150,12 @@ class Learner(common.Module):
     self.config = config
     self.obs_space = env.obs_space
     self.act_space = env.act_space['action']
-    #self.step = step
     self._state = None
-    #self.tfstep = tf.Variable(int(self.step), tf.int64)
-    #self.wm = WorldModel(config, env.obs_space, self.tfstep)
-    #self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
     self.wm = WorldModel(config, env.obs_space)
     self._task_behavior = ActorCritic(config, self.act_space)
     if config.expl_behavior == 'greedy':
       self._expl_behavior = self._task_behavior
     else:
-      #self._expl_behavior = getattr(expl2, config.expl_behavior)(
-      #    self.config, self.act_space, self.wm, self.tfstep,
-      #    lambda seq: self.wm.heads['reward'](seq['feat']).mode())
       self._expl_behavior = getattr(expl2, config.expl_behavior)(
           self.config, self.act_space, self.wm,
           lambda seq: self.wm.heads['reward'](seq['feat']).mode())

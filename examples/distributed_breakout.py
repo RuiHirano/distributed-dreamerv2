@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 root_path = Path(os.path.dirname(__file__)).joinpath("..").resolve() # /backend path
-scripts_dir = "{}/logdir/distributed_breakout".format(str(root_path))
+scripts_dir = "{}/logdir/distributed_breakout2".format(str(root_path))
 print(scripts_dir)
 config = dv2.defaults.update({
     'logdir': scripts_dir,
