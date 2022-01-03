@@ -32,7 +32,9 @@ defaults:
   num_actors: 5
   rollout_min_steps: 1000
   rollout_min_episodes: 1
-
+  train_min_steps: 5e3
+  separate_checkpoint: true
+  checkpoint_save_iter: 1e5
 
   # Agent
   clip_rewards: tanh

@@ -69,7 +69,7 @@ class Actor(common.Module):
           episode += 1
       self._obs = obs
     elapsed_time = time.time() - s_time
-    info = {"pid": self._pid, "elapsed_time": elapsed_time}
+    info = {"pid": self._pid, "elapsed_time": elapsed_time, "steps": step}
     return eps, info
   
   def _convert(self, value):

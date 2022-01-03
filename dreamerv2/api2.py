@@ -52,7 +52,8 @@ def train(env, config, outputs=None):
   should_video = common.Every(config.log_every)
   should_expl = common.Until(config.expl_until)
   should_log = common.Every(config.log_every)
-  should_save = common.Every(config.log_every)
+  should_save = common.Every(config.checkpoint_save_iter)
+  should_train = common.Every(config.train_min_steps)
 
   env = common.GymWrapper(env)
   env = common.ResizeImage(env)
@@ -73,12 +74,28 @@ def train(env, config, outputs=None):
       replay.add_episodes(episodes)
 
   print('Create agent.')
-  #agnt = agent.Agent(config, env.obs_space, env.act_space, step)
   dataset = iter(replay.dataset(**config.dataset))
   variables = None
   ray.get([actor.train.remote(next(dataset)) for actor in actors])
   ray.get(learner.train.remote(next(dataset)))
-  if (logdir / 'variables.pkl').exists():
+  
+  def get_checkpoint_filename():
+    files = (logdir).glob("variab*.pkl")
+    latest_file = logdir / 'variables.pkl' if (logdir / 'variables.pkl').exists() else None
+    latest_step = None
+    for file in files:
+      if "_" in file.name:
+        step = file.name[:-4].split("_")[1]
+        print(step)
+        if latest_step == None or latest_step < step:
+          latest_step = step
+    if latest_step:
+      latest_file = logdir / "variables_{}.pkl".format(latest_step)
+    return latest_file
+
+  checkpoint_filename = get_checkpoint_filename()
+  print("checkpoint file: {}".format(checkpoint_filename))
+  if checkpoint_filename:
     ray.get(learner.load.remote(logdir / 'variables.pkl'))
     ray.get([actor.load.remote(logdir / 'variables.pkl') for actor in actors])
     variables = ray.get(learner.get_variables.remote())
@@ -88,8 +105,6 @@ def train(env, config, outputs=None):
     for _ in range(config.pretrain):
       variables, mets, info = ray.get(learner.train.remote(next(dataset)))
       variables = ray.put(variables)
-  #policy = lambda *args: learner.policy.remote(
-  #    *args, mode='explore' if should_expl(step) else 'train')
 
   def write_log(metrics):
     for name, values in metrics.items():
@@ -122,6 +137,7 @@ def train(env, config, outputs=None):
   actor_cycle = 0
   train_num = 0
   prev_total_steps = replay.stats["total_steps"]
+  #step = replay.stats["total_steps"] # TODO
   while replay.stats["total_steps"] < config.steps:
     logger.write()
     # correct experiments
@@ -132,11 +148,12 @@ def train(env, config, outputs=None):
         episodes, info = ray.get(finished)
         replay.add_episodes(episodes)
         if should_expl(step):
-          print("expl agent")
           wip_actors.extend([actors[info["pid"]].rollout.remote(variables, steps=config.rollout_min_steps, episodes=config.rollout_min_episodes, mode='explore')])
         else:
           wip_actors.extend([actors[info["pid"]].rollout.remote(variables, steps=config.rollout_min_steps, episodes=config.rollout_min_episodes, mode='train')])
         # log
+        step.increment(amount=info["steps"])
+        #step = replay.stats["total_steps"]
         if len(episodes) > 0:
           mean_length, mean_score = 0, 0
           for ep in episodes:
@@ -144,21 +161,25 @@ def train(env, config, outputs=None):
             mean_length += length
             mean_score += score
           mean_length, mean_score = mean_length/len(episodes), mean_score/len(episodes)
-          print("[{}] Actor Cycle: {}, Steps, {}, PID: {}, Episode has {:.0f} steps and return {:.1f}., time: {:.1f}".format(replay.stats["total_steps"], actor_cycle, config.rollout_min_steps, info["pid"], mean_length, mean_score, info["elapsed_time"]))
+          print("[{}] Actor Cycle: {}, Steps, {}, Episodes: {}, PID: {}, Episode has {:.0f} steps and return {:.1f}., time: {:.1f}".format(replay.stats["total_steps"], actor_cycle, info["steps"], len(episodes), info["pid"], mean_length, mean_score, info["elapsed_time"]))
 
     # train learner
     finished_learner, _ = ray.wait([wip_learner], timeout=0)
-    if finished_learner:
+    if finished_learner and should_train(step):
       variables, mets, info = ray.get(finished_learner[0])
       [metrics[key].append(value) for key, value in mets.items()]
       variables = ray.put(variables)
       train_num += 1
       print("Finished learner train: {}, actor_cycle: {}, steps: {}, time: {:.1f}".format(train_num, actor_cycle, replay.stats["total_steps"]-prev_total_steps, info["elapsed_time"]))
+      prev_total_steps = replay.stats["total_steps"]
       actor_cycle = 0
       # write logs
       if should_log(step):
         write_log(metrics)
       # save variables
       if should_save(step):
-        learner.save.remote(logdir / 'variables.pkl')
+        if config.separate_checkpoint:
+          learner.save.remote(logdir / 'variables_{}.pkl'.format(int(step)))
+        else:
+          learner.save.remote(logdir / 'variables.pkl')
       wip_learner = learner.train.remote(next(dataset))
